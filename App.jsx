@@ -38,13 +38,14 @@ function Planner() {
   const [plannerTab, setPlannerTab] = useState('timeline'); 
   const [error, setError] = useState(null);
 
-  // Load Google Maps with Geocoding
+  // Load Google Maps
   useEffect(() => {
     if (!GOOGLE_MAPS_API_KEY) return;
     if (window.google && window.google.maps) { setIsApiLoaded(true); return; }
     
     const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker,geocoding`;
+    // We load 'places' and 'marker' libraries.
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker`;
     script.async = true;
     script.defer = true;
     script.onload = () => setIsApiLoaded(true);
@@ -109,21 +110,19 @@ function Planner() {
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
-  // --- SAFE SEARCH LOGIC (With Geocoding Fallback) ---
+  // --- OPTIMIZED SEARCH LOGIC (COORDINATE PRIORITY) ---
   const searchPlaceLogic = async (inputUrl) => {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
       let pageTitle = null; let bodyCoords = null;
 
-      // 1. Resolve Links
+      // 1. Resolve Short Links (e.g. goo.gl)
       if ((!extracted.coords && !extracted.name) && (inputUrl.includes('goo.gl') || inputUrl.includes('maps.app') || inputUrl.includes('bit.ly'))) {
           setLoadingMsg('Resolving link...');
           try {
             const resolved = await resolveShortUrl(inputUrl);
             targetUrl = resolved.url; 
-            if (resolved.title && !/Google\s*Maps?/i.test(resolved.title)) {
-                pageTitle = resolved.title;
-            }
+            if (resolved.title && !/Google\s*Maps?/i.test(resolved.title)) pageTitle = resolved.title;
             bodyCoords = resolved.coords;
             const reExtracted = extractFromUrl(targetUrl);
             extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
@@ -136,60 +135,34 @@ function Planner() {
         const { Place } = await google.maps.importLibrary("places");
         const finalCoords = extracted.coords || bodyCoords;
         
-        // --- STRATEGY A: Reverse Geocoding (Safe Mode) ---
-        // We wrap this in a separate try/catch so if it fails, we continue to Strategy B
+        let request = {
+            fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'],
+        };
+
+        // --- INTELLIGENT QUERY SELECTION ---
         if (finalCoords) {
-             try {
-                 const geocoder = new google.maps.Geocoder();
-                 // Give Geocoding 3 seconds max, otherwise skip it
-                 const geocodePromise = new Promise((resolve, reject) => {
-                     geocoder.geocode({ location: finalCoords }, (results, status) => {
-                         if (status === "OK" && results && results[0]) resolve(results);
-                         else reject(status);
-                     });
-                 });
-                 
-                 // Timeout protection for geocoding specifically
-                 const timeoutP = new Promise((_, reject) => setTimeout(() => reject("GeoTimeout"), 3000));
-                 
-                 const results = await Promise.race([geocodePromise, timeoutP]);
-                 
-                 if (results && results[0]) {
-                     const placeId = results[0].place_id;
-                     const placeRef = new Place({ id: placeId });
-                     await placeRef.fetchFields({ fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] });
-                     
-                     return {
-                         place: {
-                             name: placeRef.displayName || results[0].formatted_address,
-                             formatted_address: placeRef.formattedAddress || results[0].formatted_address,
-                             geometry: { location: placeRef.location || finalCoords },
-                             opening_hours: placeRef.regularOpeningHours ? { periods: placeRef.regularOpeningHours.periods } : null
-                         },
-                         coords: finalCoords,
-                         url: inputUrl
-                     };
-                 }
-             } catch (geoError) {
-                 console.warn("Geocoding skipped (API disabled or timed out), falling back to text search...", geoError);
-                 // Do nothing, just let it fall through to Strategy B
-             }
+            // BEST METHOD: If we have coordinates, search specifically for them.
+            // This forces Google to identify the POI at that exact spot.
+            request.textQuery = `${finalCoords.lat},${finalCoords.lng}`;
+        } else if (extracted.name) {
+            request.textQuery = extracted.name;
+        } else if (pageTitle) {
+            request.textQuery = pageTitle;
+        } else {
+            request.textQuery = inputUrl;
         }
 
-        // --- STRATEGY B: Text Search (The Reliable Backup) ---
-        let request = { fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] };
-        if (extracted.name) request.textQuery = extracted.name;
-        else if (pageTitle) request.textQuery = pageTitle;
-        else if (finalCoords) request.textQuery = `${finalCoords.lat},${finalCoords.lng}`; // Use coords as text query if Geocoding failed
-        else request.textQuery = inputUrl;
-
+        // Execute Search
         const { places } = await Place.searchByText(request);
 
         if (places && places.length > 0) {
             const place = places[0];
+            
+            // Name Cleanup: Prefer the official display name.
+            // If display name is missing or "Google Maps", fallback to address or page title.
             let bestName = place.displayName;
             if (!bestName || /Google\s*Maps?/i.test(bestName)) {
-                bestName = place.formattedAddress ? place.formattedAddress.split(',')[0] : "Pinned Location";
+                bestName = place.formattedAddress ? place.formattedAddress.split(',')[0] : (pageTitle || "Pinned Location");
             }
 
             return {
@@ -206,12 +179,12 @@ function Planner() {
             throw new Error("No results found");
         }
       } catch (e) {
-          // Final Fallback
+          // Fallback: If search fails but we have coords, plot the point anyway
           const finalCoords = extracted.coords || bodyCoords;
           if (finalCoords) {
              return { place: { name: pageTitle || "Custom Pin", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
           }
-          throw new Error("Could not identify location. Please check your internet or API settings.");
+          throw new Error("Could not identify location. Try typing the name (e.g. 'Tokyo Tower') directly.");
       }
   };
 
@@ -219,7 +192,10 @@ function Planner() {
     if (!urlInput.trim()) return;
     setIsLoading(true); setError(null);
     try {
-        const result = await searchPlaceLogic(urlInput);
+        // 8 second timeout to prevent infinite loading
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Request timed out. Check API settings.")), 8000));
+        
+        const result = await Promise.race([searchPlaceLogic(urlInput), timeoutPromise]);
         
         const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
         const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
@@ -233,18 +209,16 @@ function Planner() {
         const updatedPoints = [...currentTrip.points, newPoint];
         setCurrentTrip(prev => ({ ...prev, points: updatedPoints }));
         setUrlInput(''); updateTravelTimes(updatedPoints); 
-    } catch (e) { 
-        setError(String(e.message || e)); 
-    } finally { 
-        setIsLoading(false); 
-    }
+    } catch (e) { setError(String(e.message || e)); } finally { setIsLoading(false); }
   };
 
   const addHotel = async () => {
       if (!hotelInput.trim()) return;
       setIsLoading(true); setError(null);
       try {
-          const result = await searchPlaceLogic(hotelInput);
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000));
+          const result = await Promise.race([searchPlaceLogic(hotelInput), timeoutPromise]);
+          
           const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
           const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
           const newHotel = { id: Math.random().toString(36).substr(2, 9), name: result.place.name, address: result.place.formatted_address, lat, lng, startDay: hotelStartDay, endDay: hotelEndDay };
