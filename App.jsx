@@ -6,9 +6,13 @@ import {
   ChevronUp, ChevronDown, Star, BookOpen, X as XIcon, CalendarDays, BedDouble
 } from 'lucide-react';
 
-// --- IMPORTS ---
-import { GOOGLE_MAPS_API_KEY } from './utils/config';
-import { resolveShortUrl, extractFromUrl } from './utils/helpers';
+// --- UPDATED IMPORTS (Fixing the path error) ---
+// We added './src/' because you created these inside the src folder
+import { GOOGLE_MAPS_API_KEY } from './src/utils/config';
+import { resolveShortUrl, extractFromUrl } from './src/utils/helpers';
+
+// These likely live in the root 'components' folder based on previous steps
+// If you get an error here next, change these to './src/components/UI' as well.
 import { Button, Card, ConfirmModal } from './components/UI';
 import { MapPreview, LocationLibrary } from './components/Features';
 
