@@ -8,14 +8,8 @@ import {
 import { ClerkProvider, SignedIn, SignedOut, SignIn, UserButton } from "@clerk/clerk-react";
 
 // --- IMPORTS ---
-// If these files exist in src/utils, keep these imports. 
-// If you revert to single file, you can paste the helpers back here.
-// Assuming we are using the single-file structure for stability based on previous success:
 import { GOOGLE_MAPS_API_KEY, CLERK_PUBLISHABLE_KEY } from './src/utils/config';
 import { resolveShortUrl, extractFromUrl } from './src/utils/helpers';
-// Note: If Vercel fails with "Module not found", delete these import lines 
-// and paste the helper functions directly into this file (as shown in the fallback block below).
-
 import { Button, Card, ConfirmModal } from './src/components/UI';
 import { MapPreview, LocationLibrary } from './src/components/Features';
 
@@ -44,13 +38,13 @@ function Planner() {
   const [plannerTab, setPlannerTab] = useState('timeline'); 
   const [error, setError] = useState(null);
 
-  // Load Google Maps with the NEW libraries
+  // Load Google Maps with the NEW libraries + Geocoding
   useEffect(() => {
     if (!GOOGLE_MAPS_API_KEY) return;
     if (window.google && window.google.maps) { setIsApiLoaded(true); return; }
     
     const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker,geocoding`;
     script.async = true;
     script.defer = true;
     script.onload = () => setIsApiLoaded(true);
@@ -115,7 +109,7 @@ function Planner() {
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
-  // --- SMART SEARCH FUNCTION ---
+  // --- REVERSE GEOCODING SEARCH FUNCTION ---
   const searchPlace = async (inputUrl) => {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
@@ -127,51 +121,58 @@ function Planner() {
           try {
             const resolved = await resolveShortUrl(inputUrl);
             targetUrl = resolved.url; 
-            
-            // FIX: STRICT TITLE CHECK
-            // If the title is "Google Maps" or "Google Map", ignore it.
             if (resolved.title && !/Google\s*Maps?/i.test(resolved.title)) {
                 pageTitle = resolved.title;
-            } else {
-                pageTitle = null;
             }
-            
             bodyCoords = resolved.coords;
             const reExtracted = extractFromUrl(targetUrl);
             extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
           } catch (e) { console.warn("Link resolution skipped", e); }
       }
 
-      setLoadingMsg('Searching Google Maps...');
+      setLoadingMsg('Identifying location...');
       
-      // 2. Use the NEW 'Place' Library
       try {
         const { Place } = await google.maps.importLibrary("places");
         
-        let request = {
-            fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'],
-        };
-
-        // Decide what to search for
-        if (extracted.name) {
-            request.textQuery = extracted.name;
-        } else if (pageTitle) {
-            request.textQuery = pageTitle;
-        } else if (extracted.coords || bodyCoords) {
-            const c = extracted.coords || bodyCoords;
-            request.textQuery = `${c.lat},${c.lng}`;
-        } else {
-            request.textQuery = inputUrl;
+        // --- STRATEGY A: If we have Coordinates, use Geocoding first ---
+        const finalCoords = extracted.coords || bodyCoords;
+        
+        if (finalCoords) {
+             const geocoder = new google.maps.Geocoder();
+             const { results } = await geocoder.geocode({ location: finalCoords });
+             
+             if (results && results[0]) {
+                 // We found a specific place ID from the coordinates!
+                 // Now fetch the official Place details for that ID to get the real name.
+                 const placeId = results[0].place_id;
+                 const placeRef = new Place({ id: placeId });
+                 await placeRef.fetchFields({ fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] });
+                 
+                 return {
+                     place: {
+                         name: placeRef.displayName || results[0].formatted_address,
+                         formatted_address: placeRef.formattedAddress || results[0].formatted_address,
+                         geometry: { location: placeRef.location || finalCoords },
+                         opening_hours: placeRef.regularOpeningHours ? { periods: placeRef.regularOpeningHours.periods } : null
+                     },
+                     coords: finalCoords,
+                     url: inputUrl
+                 };
+             }
         }
 
-        // 3. Execute Search
+        // --- STRATEGY B: Text Search Fallback ---
+        let request = { fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] };
+
+        if (extracted.name) request.textQuery = extracted.name;
+        else if (pageTitle) request.textQuery = pageTitle;
+        else request.textQuery = inputUrl;
+
         const { places } = await Place.searchByText(request);
 
         if (places && places.length > 0) {
             const place = places[0];
-            
-            // FIX: NAME VALIDATION
-            // If the API returns "Google Maps" as the name, use the address instead.
             let bestName = place.displayName;
             if (!bestName || /Google\s*Maps?/i.test(bestName)) {
                 bestName = place.formattedAddress ? place.formattedAddress.split(',')[0] : "Pinned Location";
@@ -191,14 +192,12 @@ function Planner() {
             throw new Error("No results found");
         }
       } catch (e) {
-          // Fallback if API fails but we have coords
+          // Final Fallback
           const finalCoords = extracted.coords || bodyCoords;
           if (finalCoords) {
-             // FIX: FALLBACK NAME
-             // If we rely on pageTitle but it was nullified because it was "Google Map", use "Pinned Location"
-             return { place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
+             return { place: { name: pageTitle || "Custom Pin", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
           }
-          throw new Error("Google Maps could not find this place. Try searching for the name directly.");
+          throw new Error("Could not identify this location. Try searching for the name (e.g., 'Eiffel Tower') instead of the URL.");
       }
   };
 
