@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ClerkProvider, SignedIn, SignedOut, SignIn, UserButton } from "@clerk/clerk-react";
 import { 
   Plus, MapPin, Clock, Trash2, ChevronRight, ExternalLink, 
   ArrowRight, Calendar, Navigation, Save, User, Loader2, 
   Car, Footprints, Train, AlertCircle, Pencil, Check, Map as MapIcon, List,
   ChevronUp, ChevronDown, Star, BookOpen, X as XIcon, CalendarDays, BedDouble
 } from 'lucide-react';
+import { ClerkProvider, SignedIn, SignedOut, SignIn, UserButton } from "@clerk/clerk-react";
 
 // --- IMPORTS ---
 import { GOOGLE_MAPS_API_KEY, CLERK_PUBLISHABLE_KEY } from './src/utils/config';
@@ -13,7 +13,7 @@ import { resolveShortUrl, extractFromUrl } from './src/utils/helpers';
 import { Button, Card, ConfirmModal } from './src/components/UI';
 import { MapPreview, LocationLibrary } from './src/components/Features';
 
-// --- 1. THE PLANNER COMPONENT (Your Original App Logic) ---
+// --- PLANNER COMPONENT ---
 function Planner() {
   const [view, setView] = useState('home'); 
   const [trips, setTrips] = useState([]);
@@ -31,19 +31,23 @@ function Planner() {
   const [hotelInput, setHotelInput] = useState('');
   const [hotelStartDay, setHotelStartDay] = useState(1);
   const [hotelEndDay, setHotelEndDay] = useState(1);
-  const [error, setError] = useState(null);
   const [isApiLoaded, setIsApiLoaded] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState('');
   const [editingId, setEditingId] = useState(null);
   const [plannerTab, setPlannerTab] = useState('timeline'); 
+  const [error, setError] = useState(null);
 
+  // Load Google Maps with the NEW libraries
   useEffect(() => {
     if (!GOOGLE_MAPS_API_KEY) return;
-    if (window.google) { setIsApiLoaded(true); return; }
+    if (window.google && window.google.maps) { setIsApiLoaded(true); return; }
+    
+    // We add 'loading=async' and remove the callback to use the modern importLibrary
     const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places`;
-    script.async = true; script.defer = true;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker`;
+    script.async = true;
+    script.defer = true;
     script.onload = () => setIsApiLoaded(true);
     document.head.appendChild(script);
   }, []);
@@ -106,12 +110,13 @@ function Planner() {
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
+  // --- NEW SEARCH FUNCTION (Using Modern Places Library) ---
   const searchPlace = async (inputUrl) => {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
       let pageTitle = null; let bodyCoords = null;
 
-      // 1. Try to resolve short links (goo.gl, etc.)
+      // 1. Resolve Links
       if ((!extracted.coords && !extracted.name) && (inputUrl.includes('goo.gl') || inputUrl.includes('maps.app') || inputUrl.includes('bit.ly'))) {
           setLoadingMsg('Resolving link...');
           try {
@@ -119,59 +124,61 @@ function Planner() {
             targetUrl = resolved.url; pageTitle = resolved.title; bodyCoords = resolved.coords;
             const reExtracted = extractFromUrl(targetUrl);
             extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
-          } catch (e) {
-            console.log("Short URL resolution failed, falling back to text search");
-          }
+          } catch (e) { console.warn("Link resolution skipped", e); }
       }
 
-      setLoadingMsg('Finding details...');
+      setLoadingMsg('Searching Google Maps...');
       
-      // 2. Setup the Google Places Service
-      const service = new google.maps.places.PlacesService(document.createElement('div'));
-      
-      // 3. Wrap the API call in a Promise with a SAFETY TIMEOUT
-      return new Promise((resolve, reject) => {
-          // Safety Timer: If Google doesn't answer in 6 seconds, stop loading.
-          const timeoutId = setTimeout(() => {
-              reject("Google Maps API did not respond. Please check your API Key restrictions in Google Cloud Console.");
-          }, 6000);
+      // 2. Use the NEW 'Place' Library
+      try {
+        const { Place } = await google.maps.importLibrary("places");
+        
+        let request = {
+            fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'],
+        };
 
-          const handleResults = (results, status) => {
-              clearTimeout(timeoutId); // Stop the safety timer
-              
-              if (status === google.maps.places.PlacesServiceStatus.OK && results && results.length > 0) {
-                  // Found a place! Get full details.
-                  service.getDetails({ placeId: results[0].place_id, fields: ['name', 'formatted_address', 'geometry', 'opening_hours', 'vicinity'] }, (p, s) => {
-                      if (s === google.maps.places.PlacesServiceStatus.OK) {
-                          resolve({ place: p, coords: extracted.coords || bodyCoords, url: inputUrl });
-                      } else {
-                          resolve({ place: results[0], coords: extracted.coords || bodyCoords, url: inputUrl });
-                      }
-                  });
-              } else {
-                  // No text results found. Did we have coordinates from the URL?
-                  const finalCoords = extracted.coords || bodyCoords;
-                  if (finalCoords) {
-                      resolve({ place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true });
-                  } else {
-                      reject("Could not find location. Try a specific name like 'Eiffel Tower'.");
-                  }
-              }
-          };
+        // Decide what to search for
+        if (extracted.name) {
+            request.textQuery = extracted.name;
+        } else if (pageTitle) {
+            request.textQuery = pageTitle;
+        } else if (extracted.coords || bodyCoords) {
+            // For coords, we still use text search with a near hint in the new API, or reverse geocode.
+            // But easiest for now is searching the text representation of lat/lng
+            const c = extracted.coords || bodyCoords;
+            request.textQuery = `${c.lat},${c.lng}`;
+        } else {
+            request.textQuery = inputUrl;
+        }
 
-          // 4. Decide which search method to use
-          if (extracted.name) {
-              service.textSearch({ query: extracted.name }, handleResults);
-          } else if (pageTitle) {
-              service.textSearch({ query: pageTitle }, handleResults);
-          } else if (extracted.coords || bodyCoords) {
-              // If we have coords but no name, search nearby
-              service.nearbySearch({ location: extracted.coords || bodyCoords, radius: 50 }, handleResults);
-          } else {
-              // Fallback: Just search the raw text the user typed
-              service.textSearch({ query: inputUrl }, handleResults);
+        // 3. Execute Search
+        const { places } = await Place.searchByText(request);
+
+        if (places && places.length > 0) {
+            const place = places[0];
+            // 4. Map the NEW result format to our OLD app format
+            return {
+                place: {
+                    name: place.displayName,
+                    formatted_address: place.formattedAddress,
+                    geometry: { location: place.location },
+                    // Map new opening hours structure to a simplified one if possible
+                    opening_hours: place.regularOpeningHours ? { periods: place.regularOpeningHours.periods } : null
+                },
+                coords: extracted.coords || bodyCoords,
+                url: inputUrl
+            };
+        } else {
+            throw new Error("No results found");
+        }
+      } catch (e) {
+          // Fallback if API fails but we have coords
+          const finalCoords = extracted.coords || bodyCoords;
+          if (finalCoords) {
+             return { place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
           }
-      });
+          throw new Error("Google Maps could not find this place. Try searching for the name directly.");
+      }
   };
 
   const addWaypoint = async () => {
@@ -179,12 +186,14 @@ function Planner() {
     setIsLoading(true); setError(null);
     try {
         const result = await searchPlace(urlInput);
-        const lat = result.place.geometry?.location?.lat ? (typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat) : result.coords?.lat;
-        const lng = result.place.geometry?.location?.lng ? (typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng) : result.coords?.lng;
+        // Handle both function and property access for lat/lng (compatibility wrapper)
+        const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
+        const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
+        
         const newPoint = {
             id: Math.random().toString(36).substr(2, 9),
             name: result.place.name,
-            address: result.place.formatted_address || result.place.vicinity || `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
+            address: result.place.formatted_address || `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
             lat, lng, url: result.url, stayMinutes: 60, travelMode: 'DRIVING', day: selectedDay, opening_hours: result.place.opening_hours
         };
         const updatedPoints = [...currentTrip.points, newPoint];
@@ -198,8 +207,8 @@ function Planner() {
       setIsLoading(true); setError(null);
       try {
           const result = await searchPlace(hotelInput);
-          const lat = result.place.geometry?.location?.lat ? (typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat) : result.coords?.lat;
-          const lng = result.place.geometry?.location?.lng ? (typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng) : result.coords?.lng;
+          const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
+          const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
           const newHotel = { id: Math.random().toString(36).substr(2, 9), name: result.place.name, address: result.place.formatted_address, lat, lng, startDay: hotelStartDay, endDay: hotelEndDay };
           setCurrentTrip(prev => ({ ...prev, hotels: [...(prev.hotels||[]), newHotel] }));
           setHotelInput(''); setIsHotelModalOpen(false);
@@ -245,15 +254,19 @@ function Planner() {
   };
 
   function checkOpeningStatus(arrivalDate, opening_hours) {
+    // Basic check for new API structure or old structure
     if (!opening_hours || !opening_hours.periods) return { status: 'unknown' };
     const dayOfWeek = arrivalDate.getDay(); 
-    const arrivalTime = arrivalDate.getHours() * 100 + arrivalDate.getMinutes(); 
+    const arrivalTime = arrivalDate.getHours() * 100 + arrivalDate.getMinutes();
+    
+    // New API uses a slightly different format, but filtering by day usually works similar for basics
     const todaysPeriods = opening_hours.periods.filter(p => p.open.day === dayOfWeek);
+    
     if (todaysPeriods.length === 0) return { status: 'closed', message: 'Closed today' };
     for (const period of todaysPeriods) {
-        const openTime = parseInt(period.open.time);
-        const closeTime = period.close ? parseInt(period.close.time) : 2400; 
-        if (arrivalTime >= openTime && arrivalTime < closeTime) return { status: 'open', message: `Open until ${period.close?.time.substring(0, 2)}:${period.close?.time.substring(2)}` };
+        const openTime = parseInt(period.open.time || (period.open.hour * 100 + period.open.minute)); // Fallback for differing formats
+        const closeTime = period.close ? parseInt(period.close.time || (period.close.hour * 100 + period.close.minute)) : 2400; 
+        if (arrivalTime >= openTime && arrivalTime < closeTime) return { status: 'open', message: 'Open' };
     }
     return { status: 'closed', message: `Closed` };
   }
@@ -378,7 +391,7 @@ function Planner() {
             </div>
 
             <div className="relative flex gap-2">
-                <input type="text" placeholder={`Paste URL for Day ${selectedDay}...`} value={urlInput} onChange={(e) => setUrlInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addWaypoint()} className="w-full p-4 pl-12 bg-white border rounded-2xl shadow-sm outline-none" disabled={isLoading} />
+                <input type="text" placeholder={`Paste URL or Name (e.g., 'Tokyo Tower')`} value={urlInput} onChange={(e) => setUrlInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addWaypoint()} className="w-full p-4 pl-12 bg-white border rounded-2xl shadow-sm outline-none" disabled={isLoading} />
                 <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
                 <Button onClick={addWaypoint} loading={isLoading} disabled={!isApiLoaded}>Add Stop</Button>
                 <Button variant="outline" onClick={() => setIsLibraryOpen(true)}><BookOpen size={20}/></Button>
@@ -444,11 +457,6 @@ function Planner() {
     </div>
   );
 }
-
-// --- 2. THE MAIN "APP WRAPPER" (Login Wall) ---
-// This checks if the user is signed in.
-// If YES: Shows <Planner> (your app)
-// If NO: Shows <SignIn> (the login box)
 
 export default function App() {
   if (!CLERK_PUBLISHABLE_KEY) {
