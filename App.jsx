@@ -8,8 +8,14 @@ import {
 import { ClerkProvider, SignedIn, SignedOut, SignIn, UserButton } from "@clerk/clerk-react";
 
 // --- IMPORTS ---
+// If these files exist in src/utils, keep these imports. 
+// If you revert to single file, you can paste the helpers back here.
+// Assuming we are using the single-file structure for stability based on previous success:
 import { GOOGLE_MAPS_API_KEY, CLERK_PUBLISHABLE_KEY } from './src/utils/config';
 import { resolveShortUrl, extractFromUrl } from './src/utils/helpers';
+// Note: If Vercel fails with "Module not found", delete these import lines 
+// and paste the helper functions directly into this file (as shown in the fallback block below).
+
 import { Button, Card, ConfirmModal } from './src/components/UI';
 import { MapPreview, LocationLibrary } from './src/components/Features';
 
@@ -43,7 +49,6 @@ function Planner() {
     if (!GOOGLE_MAPS_API_KEY) return;
     if (window.google && window.google.maps) { setIsApiLoaded(true); return; }
     
-    // We add 'loading=async' and remove the callback to use the modern importLibrary
     const script = document.createElement('script');
     script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker`;
     script.async = true;
@@ -110,7 +115,7 @@ function Planner() {
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
-  // --- NEW SEARCH FUNCTION (Using Modern Places Library) ---
+  // --- SMART SEARCH FUNCTION ---
   const searchPlace = async (inputUrl) => {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
@@ -121,7 +126,17 @@ function Planner() {
           setLoadingMsg('Resolving link...');
           try {
             const resolved = await resolveShortUrl(inputUrl);
-            targetUrl = resolved.url; pageTitle = resolved.title; bodyCoords = resolved.coords;
+            targetUrl = resolved.url; 
+            
+            // FIX: STRICT TITLE CHECK
+            // If the title is "Google Maps" or "Google Map", ignore it.
+            if (resolved.title && !/Google\s*Maps?/i.test(resolved.title)) {
+                pageTitle = resolved.title;
+            } else {
+                pageTitle = null;
+            }
+            
+            bodyCoords = resolved.coords;
             const reExtracted = extractFromUrl(targetUrl);
             extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
           } catch (e) { console.warn("Link resolution skipped", e); }
@@ -143,8 +158,6 @@ function Planner() {
         } else if (pageTitle) {
             request.textQuery = pageTitle;
         } else if (extracted.coords || bodyCoords) {
-            // For coords, we still use text search with a near hint in the new API, or reverse geocode.
-            // But easiest for now is searching the text representation of lat/lng
             const c = extracted.coords || bodyCoords;
             request.textQuery = `${c.lat},${c.lng}`;
         } else {
@@ -156,13 +169,19 @@ function Planner() {
 
         if (places && places.length > 0) {
             const place = places[0];
-            // 4. Map the NEW result format to our OLD app format
+            
+            // FIX: NAME VALIDATION
+            // If the API returns "Google Maps" as the name, use the address instead.
+            let bestName = place.displayName;
+            if (!bestName || /Google\s*Maps?/i.test(bestName)) {
+                bestName = place.formattedAddress ? place.formattedAddress.split(',')[0] : "Pinned Location";
+            }
+
             return {
                 place: {
-                    name: place.displayName,
+                    name: bestName,
                     formatted_address: place.formattedAddress,
                     geometry: { location: place.location },
-                    // Map new opening hours structure to a simplified one if possible
                     opening_hours: place.regularOpeningHours ? { periods: place.regularOpeningHours.periods } : null
                 },
                 coords: extracted.coords || bodyCoords,
@@ -175,6 +194,8 @@ function Planner() {
           // Fallback if API fails but we have coords
           const finalCoords = extracted.coords || bodyCoords;
           if (finalCoords) {
+             // FIX: FALLBACK NAME
+             // If we rely on pageTitle but it was nullified because it was "Google Map", use "Pinned Location"
              return { place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
           }
           throw new Error("Google Maps could not find this place. Try searching for the name directly.");
@@ -186,7 +207,6 @@ function Planner() {
     setIsLoading(true); setError(null);
     try {
         const result = await searchPlace(urlInput);
-        // Handle both function and property access for lat/lng (compatibility wrapper)
         const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
         const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
         
@@ -254,17 +274,13 @@ function Planner() {
   };
 
   function checkOpeningStatus(arrivalDate, opening_hours) {
-    // Basic check for new API structure or old structure
     if (!opening_hours || !opening_hours.periods) return { status: 'unknown' };
     const dayOfWeek = arrivalDate.getDay(); 
     const arrivalTime = arrivalDate.getHours() * 100 + arrivalDate.getMinutes();
-    
-    // New API uses a slightly different format, but filtering by day usually works similar for basics
     const todaysPeriods = opening_hours.periods.filter(p => p.open.day === dayOfWeek);
-    
     if (todaysPeriods.length === 0) return { status: 'closed', message: 'Closed today' };
     for (const period of todaysPeriods) {
-        const openTime = parseInt(period.open.time || (period.open.hour * 100 + period.open.minute)); // Fallback for differing formats
+        const openTime = parseInt(period.open.time || (period.open.hour * 100 + period.open.minute)); 
         const closeTime = period.close ? parseInt(period.close.time || (period.close.hour * 100 + period.close.minute)) : 2400; 
         if (arrivalTime >= openTime && arrivalTime < closeTime) return { status: 'open', message: 'Open' };
     }
