@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { ClerkProvider, SignedIn, SignedOut, SignIn, UserButton } from "@clerk/clerk-react";
 import { 
   Plus, MapPin, Clock, Trash2, ChevronRight, ExternalLink, 
   ArrowRight, Calendar, Navigation, Save, User, Loader2, 
@@ -6,15 +7,14 @@ import {
   ChevronUp, ChevronDown, Star, BookOpen, X as XIcon, CalendarDays, BedDouble
 } from 'lucide-react';
 
-// --- FIXED IMPORTS (Pointing to src folder) ---
-import { GOOGLE_MAPS_API_KEY } from './src/utils/config';
+// --- IMPORTS ---
+import { GOOGLE_MAPS_API_KEY, CLERK_PUBLISHABLE_KEY } from './src/utils/config';
 import { resolveShortUrl, extractFromUrl } from './src/utils/helpers';
 import { Button, Card, ConfirmModal } from './src/components/UI';
 import { MapPreview, LocationLibrary } from './src/components/Features';
 
-// --- CORE APP COMPONENT ---
-
-export default function App() {
+// --- 1. THE PLANNER COMPONENT (Your Original App Logic) ---
+function Planner() {
   const [view, setView] = useState('home'); 
   const [trips, setTrips] = useState([]);
   const [savedLocations, setSavedLocations] = useState([]);
@@ -302,7 +302,7 @@ export default function App() {
           <span className="text-xl font-bold tracking-tight">Sequence</span>
         </div>
         <div className="flex items-center gap-4">
-          <Button variant="ghost" icon={User}>Profile</Button>
+          <UserButton afterSignOutUrl="/" />
           {view === 'planner' && <Button onClick={saveTrip} icon={Save}>Save Trip</Button>}
         </div>
       </nav>
@@ -407,5 +407,34 @@ export default function App() {
         <div className="fixed bottom-8 right-8"><Button onClick={saveTrip} className="px-8 shadow-2xl" icon={Save}>Save Adventure</Button></div>
       )}
     </div>
+  );
+}
+
+// --- 2. THE MAIN "APP WRAPPER" (Login Wall) ---
+// This checks if the user is signed in.
+// If YES: Shows <Planner> (your app)
+// If NO: Shows <SignIn> (the login box)
+
+export default function App() {
+  if (!CLERK_PUBLISHABLE_KEY) {
+      return <div className="p-8 text-center text-red-500 font-bold">Missing Clerk Publishable Key in Vercel!</div>
+  }
+
+  return (
+    <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY}>
+      <SignedOut>
+        <div className="min-h-screen bg-[#FBFBFD] flex flex-col items-center justify-center p-6">
+          <div className="text-center mb-8 space-y-4">
+             <div className="w-16 h-16 bg-black rounded-2xl flex items-center justify-center text-white font-bold text-3xl mx-auto mb-4">S</div>
+             <h1 className="text-4xl font-extrabold tracking-tight">Sequence Planner</h1>
+             <p className="text-zinc-500">Sign in to access your travel plans.</p>
+          </div>
+          <SignIn />
+        </div>
+      </SignedOut>
+      <SignedIn>
+        <Planner />
+      </SignedIn>
+    </ClerkProvider>
   );
 }
