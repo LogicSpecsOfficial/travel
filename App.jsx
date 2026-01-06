@@ -38,13 +38,12 @@ function Planner() {
   const [plannerTab, setPlannerTab] = useState('timeline'); 
   const [error, setError] = useState(null);
 
-  // Load Google Maps with Geocoding enabled
+  // Load Google Maps with Geocoding
   useEffect(() => {
     if (!GOOGLE_MAPS_API_KEY) return;
     if (window.google && window.google.maps) { setIsApiLoaded(true); return; }
     
     const script = document.createElement('script');
-    // Ensure 'geocoding' is in the libraries list
     script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&loading=async&libraries=places,marker,geocoding`;
     script.async = true;
     script.defer = true;
@@ -110,7 +109,7 @@ function Planner() {
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
-  // --- SEARCH LOGIC ---
+  // --- SAFE SEARCH LOGIC (With Geocoding Fallback) ---
   const searchPlaceLogic = async (inputUrl) => {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
@@ -137,39 +136,51 @@ function Planner() {
         const { Place } = await google.maps.importLibrary("places");
         const finalCoords = extracted.coords || bodyCoords;
         
-        // --- STRATEGY A: Reverse Geocoding (Coordinates -> Name) ---
+        // --- STRATEGY A: Reverse Geocoding (Safe Mode) ---
+        // We wrap this in a separate try/catch so if it fails, we continue to Strategy B
         if (finalCoords) {
-             const geocoder = new google.maps.Geocoder();
-             // We wrap this in a promise to handle the callback style of geocode
-             const geocodeResult = await new Promise((resolve) => {
-                 geocoder.geocode({ location: finalCoords }, (results, status) => {
-                     if (status === "OK" && results && results[0]) resolve(results);
-                     else resolve(null);
+             try {
+                 const geocoder = new google.maps.Geocoder();
+                 // Give Geocoding 3 seconds max, otherwise skip it
+                 const geocodePromise = new Promise((resolve, reject) => {
+                     geocoder.geocode({ location: finalCoords }, (results, status) => {
+                         if (status === "OK" && results && results[0]) resolve(results);
+                         else reject(status);
+                     });
                  });
-             });
-             
-             if (geocodeResult && geocodeResult[0]) {
-                 const placeId = geocodeResult[0].place_id;
-                 const placeRef = new Place({ id: placeId });
-                 await placeRef.fetchFields({ fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] });
                  
-                 return {
-                     place: {
-                         name: placeRef.displayName || geocodeResult[0].formatted_address,
-                         formatted_address: placeRef.formattedAddress || geocodeResult[0].formatted_address,
-                         geometry: { location: placeRef.location || finalCoords },
-                         opening_hours: placeRef.regularOpeningHours ? { periods: placeRef.regularOpeningHours.periods } : null
-                     },
-                     coords: finalCoords,
-                     url: inputUrl
-                 };
+                 // Timeout protection for geocoding specifically
+                 const timeoutP = new Promise((_, reject) => setTimeout(() => reject("GeoTimeout"), 3000));
+                 
+                 const results = await Promise.race([geocodePromise, timeoutP]);
+                 
+                 if (results && results[0]) {
+                     const placeId = results[0].place_id;
+                     const placeRef = new Place({ id: placeId });
+                     await placeRef.fetchFields({ fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] });
+                     
+                     return {
+                         place: {
+                             name: placeRef.displayName || results[0].formatted_address,
+                             formatted_address: placeRef.formattedAddress || results[0].formatted_address,
+                             geometry: { location: placeRef.location || finalCoords },
+                             opening_hours: placeRef.regularOpeningHours ? { periods: placeRef.regularOpeningHours.periods } : null
+                         },
+                         coords: finalCoords,
+                         url: inputUrl
+                     };
+                 }
+             } catch (geoError) {
+                 console.warn("Geocoding skipped (API disabled or timed out), falling back to text search...", geoError);
+                 // Do nothing, just let it fall through to Strategy B
              }
         }
 
-        // --- STRATEGY B: Text Search ---
+        // --- STRATEGY B: Text Search (The Reliable Backup) ---
         let request = { fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] };
         if (extracted.name) request.textQuery = extracted.name;
         else if (pageTitle) request.textQuery = pageTitle;
+        else if (finalCoords) request.textQuery = `${finalCoords.lat},${finalCoords.lng}`; // Use coords as text query if Geocoding failed
         else request.textQuery = inputUrl;
 
         const { places } = await Place.searchByText(request);
@@ -195,30 +206,21 @@ function Planner() {
             throw new Error("No results found");
         }
       } catch (e) {
-          // Fallback
+          // Final Fallback
           const finalCoords = extracted.coords || bodyCoords;
           if (finalCoords) {
              return { place: { name: pageTitle || "Custom Pin", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true };
           }
-          throw new Error("Could not identify location. Please try typing the name (e.g. 'Tokyo Tower').");
+          throw new Error("Could not identify location. Please check your internet or API settings.");
       }
   };
 
-  // --- ADD WAYPOINT WITH TIMEOUT PROTECTION ---
   const addWaypoint = async () => {
     if (!urlInput.trim()) return;
-    setIsLoading(true); 
-    setError(null);
-
+    setIsLoading(true); setError(null);
     try {
-        // Create a "Timeout Promise" that rejects after 8 seconds
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Request timed out. Check your Geocoding API settings.")), 8000)
-        );
-
-        // Race the search against the timeout
-        const result = await Promise.race([searchPlaceLogic(urlInput), timeoutPromise]);
-
+        const result = await searchPlaceLogic(urlInput);
+        
         const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
         const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
         
@@ -242,9 +244,7 @@ function Planner() {
       if (!hotelInput.trim()) return;
       setIsLoading(true); setError(null);
       try {
-          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000));
-          const result = await Promise.race([searchPlaceLogic(hotelInput), timeoutPromise]);
-          
+          const result = await searchPlaceLogic(hotelInput);
           const lat = typeof result.place.geometry.location.lat === 'function' ? result.place.geometry.location.lat() : result.place.geometry.location.lat;
           const lng = typeof result.place.geometry.location.lng === 'function' ? result.place.geometry.location.lng() : result.place.geometry.location.lng;
           const newHotel = { id: Math.random().toString(36).substr(2, 9), name: result.place.name, address: result.place.formatted_address, lat, lng, startDay: hotelStartDay, endDay: hotelEndDay };
