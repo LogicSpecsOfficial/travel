@@ -74,26 +74,16 @@ function Planner() {
       if (type === 'point') {
           const newPoints = currentTrip.points.filter(p => p.id !== id);
           setCurrentTrip(prev => ({ ...prev, points: newPoints }));
-          updateTravelTimes(newPoints);
       } else if (type === 'hotel') {
           setCurrentTrip(prev => ({ ...prev, hotels: (prev.hotels || []).filter(h => h.id !== id) }));
-      } else if (type === 'library') {
-          const newLocations = savedLocations.filter(l => l.id !== id);
-          setSavedLocations(newLocations);
-          localStorage.setItem('sequence_saved_locations', JSON.stringify(newLocations));
-      } else if (type === 'duration') {
-          const newCount = id;
-          setCurrentTrip(prev => ({ ...prev, dayCount: newCount, points: prev.points.filter(p => (p.day || 1) <= newCount) }));
-          if (selectedDay > newCount) setSelectedDay(newCount);
       }
       setDeleteConfirmation({ isOpen: false, id: null, type: null, message: '' });
   };
 
-  // --- IMPROVED SEARCH: Link Only + Reverse POI Mapping ---
+  // --- FIXED SEARCH LOGIC ---
   const searchPlaceLogic = async (inputUrl) => {
-      // REQUIREMENT: Must be a link
       if (!inputUrl.includes('http') && !inputUrl.includes('maps')) {
-          throw new Error("Please paste a valid Google Maps link (URLs only).");
+          throw new Error("Please paste a valid Google Maps link.");
       }
 
       let targetUrl = inputUrl;
@@ -110,33 +100,32 @@ function Planner() {
           extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
       }
 
-      setLoadingMsg('Finding location details...');
+      setLoadingMsg('Fetching details...');
       
       try {
         const { Place } = await google.maps.importLibrary("places");
         const finalCoords = extracted.coords || bodyCoords;
         
-        let request = { fields: ['displayName', 'formattedAddress', 'location', 'regularOpeningHours'] };
+        let request = { 
+            fields: ['displayName', 'formattedAddress', 'location'],
+            textQuery: pageTitle || extracted.name || inputUrl 
+        };
 
-        // If we have coordinates, search for the POI at that spot
+        // Corrected locationRestriction format for Places API (New)
         if (finalCoords) {
             request.locationRestriction = {
-                center: finalCoords,
-                radius: 5 // Target strictly within 5 meters
+                center: { lat: finalCoords.lat, lng: finalCoords.lng },
+                radius: 20.0 // Increased radius and ensured float
             };
-            request.textQuery = pageTitle || extracted.name || "point of interest";
-        } else if (extracted.name) {
-            request.textQuery = extracted.name;
-        } else {
-            request.textQuery = inputUrl;
         }
 
         const { places } = await Place.searchByText(request);
 
         if (places && places.length > 0) {
             const place = places[0];
-            let name = place.displayName;
-            // Final safety: if name is generic, use the first part of address
+            // Accessing displayName correctly based on the new API object structure
+            let name = typeof place.displayName === 'string' ? place.displayName : place.displayName?.text || place.displayName;
+            
             if (!name || /Google\s*Maps?/i.test(name)) {
                 name = place.formattedAddress ? place.formattedAddress.split(',')[0] : "Location";
             }
@@ -145,19 +134,17 @@ function Planner() {
                 place: {
                     name: name,
                     formatted_address: place.formattedAddress,
-                    geometry: { location: place.location },
-                    opening_hours: place.regularOpeningHours ? { periods: place.regularOpeningHours.periods } : null
+                    geometry: { location: place.location }
                 },
                 coords: finalCoords,
                 url: inputUrl
             };
         } else if (finalCoords) {
-             // If Google finds no "Place", use Geocoder for a raw address name
              const geocoder = new google.maps.Geocoder();
              const geoRes = await geocoder.geocode({ location: finalCoords });
              return {
                  place: {
-                     name: geoRes.results[0]?.formatted_address.split(',')[0] || "Custom Stop",
+                     name: geoRes.results[0]?.formatted_address.split(',')[0] || "Pinned Location",
                      formatted_address: geoRes.results[0]?.formatted_address,
                      geometry: { location: finalCoords }
                  },
@@ -165,9 +152,10 @@ function Planner() {
                  url: inputUrl
              };
         }
-        throw new Error("No details found for this link.");
+        throw new Error("No place found for this link.");
       } catch (e) {
-          throw e;
+          console.error(e);
+          throw new Error("Search failed. Ensure your link is correct.");
       }
   };
 
@@ -182,12 +170,11 @@ function Planner() {
         const newPoint = {
             id: Math.random().toString(36).substr(2, 9),
             name: result.place.name,
-            address: result.place.formatted_address || `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
-            lat, lng, url: result.url, stayMinutes: 60, travelMode: 'DRIVING', day: selectedDay, opening_hours: result.place.opening_hours
+            address: result.place.formatted_address,
+            lat, lng, url: result.url, stayMinutes: 60, day: selectedDay
         };
-        const updatedPoints = [...currentTrip.points, newPoint];
-        setCurrentTrip(prev => ({ ...prev, points: updatedPoints }));
-        setUrlInput(''); updateTravelTimes(updatedPoints); 
+        setCurrentTrip(prev => ({ ...prev, points: [...prev.points, newPoint] }));
+        setUrlInput('');
     } catch (e) { setError(e.message); } finally { setIsLoading(false); }
   };
 
@@ -204,71 +191,24 @@ function Planner() {
       } catch (e) { setError(e.message); } finally { setIsLoading(false); }
   };
 
-  const updateTravelTimes = async (points) => {
-    const dayPoints = points.filter(p => (p.day || 1) === selectedDay);
-    if (dayPoints.length < 2 || !isApiLoaded) return;
-    const service = new google.maps.DistanceMatrixService();
-    const origins = dayPoints.slice(0, -1).map(p => ({ lat: p.lat, lng: p.lng }));
-    const destinations = dayPoints.slice(1).map(p => ({ lat: p.lat, lng: p.lng }));
-    try {
-      const response = await service.getDistanceMatrix({ origins, destinations, travelMode: google.maps.TravelMode.DRIVING });
-      if (response.rows) {
-        const updatedPoints = [...points];
-        dayPoints.forEach((point, i) => {
-          if (i < dayPoints.length - 1) {
-            const el = response.rows[i].elements[i];
-            if (el.status === "OK") {
-              const idx = updatedPoints.findIndex(p => p.id === point.id);
-              updatedPoints[idx] = { ...point, travelData: { toId: dayPoints[i+1].id, mode: 'DRIVING', distance: el.distance.text, duration: Math.ceil(el.duration.value / 60) } };
-            }
-          }
-        });
-        setCurrentTrip(prev => ({ ...prev, points: updatedPoints }));
-      }
-    } catch (e) {}
-  };
-
-  const updateStay = (id, mins) => setCurrentTrip(prev => ({ ...prev, points: prev.points.map(p => p.id === id ? { ...p, stayMinutes: parseInt(mins)||0 } : p) }));
-  const updatePointDetails = (id, field, value) => setCurrentTrip(prev => ({ ...prev, points: prev.points.map(p => p.id === id ? { ...p, [field]: value } : p) }));
-  const movePoint = (idx, dir) => {
-    const dayPoints = currentTrip.points.filter(p => (p.day||1)===selectedDay);
-    const itemToMove = dayPoints[idx]; const itemTarget = dir===-1 ? dayPoints[idx-1] : dayPoints[idx+1];
-    if (!itemToMove || !itemTarget) return;
-    const idxFrom = currentTrip.points.findIndex(p=>p.id===itemToMove.id);
-    const idxTo = currentTrip.points.findIndex(p=>p.id===itemTarget.id);
-    const newPoints = [...currentTrip.points];
-    [newPoints[idxFrom], newPoints[idxTo]] = [newPoints[idxTo], newPoints[idxFrom]];
-    setCurrentTrip(prev => ({ ...prev, points: newPoints }));
-    updateTravelTimes(newPoints);
-  };
-
   const timelineData = useMemo(() => {
     const dayPoints = currentTrip.points.filter(p => (p.day || 1) === selectedDay);
-    const activeHotel = currentTrip.hotels ? currentTrip.hotels.find(h => selectedDay >= h.startDay && selectedDay <= h.endDay) : null;
-    let displayPoints = [];
-    if (activeHotel) displayPoints.push({ id: `h-s-${selectedDay}`, name: `${activeHotel.name} (Start)`, address: activeHotel.address, lat: activeHotel.lat, lng: activeHotel.lng, isHotel: true });
-    displayPoints = [...displayPoints, ...dayPoints];
-    if (activeHotel) displayPoints.push({ id: `h-e-${selectedDay}`, name: `${activeHotel.name} (End)`, address: activeHotel.address, lat: activeHotel.lat, lng: activeHotel.lng, isHotel: true });
-
     let currentTime = new Date(currentTrip.startDate || new Date());
     currentTime.setDate(currentTime.getDate() + (selectedDay - 1));
     const [h, m] = (currentTrip.startTime || "09:00").split(':').map(Number);
     currentTime.setHours(h, m, 0);
 
-    return displayPoints.map((point, index) => {
+    return dayPoints.map((point) => {
       const startTime = new Date(currentTime);
       currentTime.setMinutes(currentTime.getMinutes() + (point.stayMinutes || 0));
       const endTime = new Date(currentTime);
-      let travelTime = point.isHotel ? 30 : (point.travelData?.duration || 15);
-      if (index < displayPoints.length - 1) currentTime.setMinutes(currentTime.getMinutes() + travelTime);
       return {
         ...point,
         startTime: startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        endTime: endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        computedTravel: travelTime
+        endTime: endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
     });
-  }, [currentTrip.points, currentTrip.startTime, currentTrip.startDate, currentTrip.hotels, selectedDay]);
+  }, [currentTrip.points, currentTrip.startTime, currentTrip.startDate, selectedDay]);
 
   return (
     <div className="min-h-screen bg-[#FBFBFD] text-zinc-900 font-sans">
@@ -277,7 +217,7 @@ function Planner() {
       {isHotelModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/20 backdrop-blur-sm">
             <div className="bg-white w-full max-w-lg rounded-3xl p-6 shadow-2xl">
-                <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><BedDouble /> Hotels</h2>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><BedDouble /> Add Hotel</h2>
                 <input className="w-full p-3 border rounded-xl mb-4" placeholder="Paste Hotel Google Maps Link..." value={hotelInput} onChange={(e) => setHotelInput(e.target.value)} />
                 <div className="flex justify-end gap-2">
                     <Button variant="outline" onClick={() => setIsHotelModalOpen(false)}>Cancel</Button>
@@ -316,27 +256,27 @@ function Planner() {
             </div>
             
             <div className="relative flex gap-2">
-                <input type="text" placeholder="Paste Google Maps Link only..." value={urlInput} onChange={(e) => setUrlInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addWaypoint()} className="w-full p-4 pl-12 bg-white border rounded-2xl shadow-sm outline-none" disabled={isLoading} />
+                <input type="text" placeholder="Paste Google Maps Link..." value={urlInput} onChange={(e) => setUrlInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addWaypoint()} className="w-full p-4 pl-12 bg-white border rounded-2xl shadow-sm outline-none" disabled={isLoading} />
                 <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
                 <Button onClick={addWaypoint} loading={isLoading} disabled={!isApiLoaded}>Add Stop</Button>
             </div>
-            {error && <p className="text-red-500 text-sm">{error}</p>}
+            {error && <p className="text-red-500 text-sm font-medium">{error}</p>}
 
             <div className="space-y-4 ml-4 border-l-2 pl-8">
-                {timelineData.map((point, idx) => (
-                    <Card key={point.id} className={point.isHotel ? 'bg-blue-50/50' : ''}>
+                {timelineData.length === 0 ? <p className="text-zinc-400">No stops added yet.</p> : timelineData.map((point) => (
+                    <Card key={point.id}>
                         <div className="flex justify-between items-start">
                             <div>
                                 <span className="text-xs font-bold text-zinc-400">{point.startTime} - {point.endTime}</span>
                                 <h3 className="text-xl font-bold">{point.name}</h3>
                                 <p className="text-sm text-zinc-500">{point.address}</p>
                             </div>
-                            {!point.isHotel && <button onClick={() => setDeleteConfirmation({isOpen:true, id: point.id, type: 'point', message: 'Delete?'})}><Trash2 className="text-zinc-300 hover:text-red-500" size={18}/></button>}
+                            <button onClick={() => setDeleteConfirmation({isOpen:true, id: point.id, type: 'point', message: 'Delete this stop?'})}><Trash2 className="text-zinc-300 hover:text-red-500" size={18}/></button>
                         </div>
                     </Card>
                 ))}
             </div>
-            <Button onClick={saveTrip} className="w-full">Save and Exit</Button>
+            <Button onClick={saveTrip} className="w-full py-4 text-lg">Save and Exit</Button>
           </div>
         )}
       </main>
