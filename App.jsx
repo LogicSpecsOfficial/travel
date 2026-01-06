@@ -81,7 +81,7 @@ function Planner() {
   };
 
   // --- FIXED SEARCH LOGIC ---
-  const searchPlaceLogic = async (inputUrl) => {
+ const searchPlaceLogic = async (inputUrl) => {
       if (!inputUrl.includes('http') && !inputUrl.includes('maps')) {
           throw new Error("Please paste a valid Google Maps link.");
       }
@@ -106,19 +106,62 @@ function Planner() {
         const { Place } = await google.maps.importLibrary("places");
         const finalCoords = extracted.coords || bodyCoords;
         
+        // Use the query from the link or name, or fallback to URL
+        const query = pageTitle || extracted.name || inputUrl;
+
         let request = { 
             fields: ['displayName', 'formattedAddress', 'location'],
-            textQuery: pageTitle || extracted.name || inputUrl 
+            textQuery: query
         };
 
-        // Corrected locationRestriction format for Places API (New)
+        // FIX: Ensure center is a google.maps.LatLng object
         if (finalCoords) {
             request.locationRestriction = {
-                center: { lat: finalCoords.lat, lng: finalCoords.lng },
-                radius: 20.0 // Increased radius and ensured float
+                center: new google.maps.LatLng(finalCoords.lat, finalCoords.lng),
+                radius: 50.0 
             };
         }
 
+        const { places } = await Place.searchByText(request);
+
+        if (places && places.length > 0) {
+            const place = places[0];
+            let name = place.displayName;
+            if (typeof name === 'object') name = name.text; // Handle object structure
+            
+            if (!name || /Google\s*Maps?/i.test(name)) {
+                name = place.formattedAddress ? place.formattedAddress.split(',')[0] : "Location";
+            }
+
+            return {
+                place: {
+                    name: name,
+                    formatted_address: place.formattedAddress,
+                    geometry: { location: place.location }
+                },
+                coords: finalCoords,
+                url: inputUrl
+            };
+        } else if (finalCoords) {
+             // Fallback to Geocoder if Search returns 0 results
+             const geocoder = new google.maps.Geocoder();
+             const geoRes = await geocoder.geocode({ location: finalCoords });
+             return {
+                 place: {
+                     name: geoRes.results[0]?.formatted_address.split(',')[0] || "Pinned Location",
+                     formatted_address: geoRes.results[0]?.formatted_address,
+                     geometry: { location: finalCoords }
+                 },
+                 coords: finalCoords,
+                 url: inputUrl
+             };
+        }
+        throw new Error("No place found for this link.");
+      } catch (e) {
+          console.error("Maps API Error:", e);
+          throw new Error("Google Maps Error: " + (e.message || "Check Console"));
+      }
+  };
         const { places } = await Place.searchByText(request);
 
         if (places && places.length > 0) {
