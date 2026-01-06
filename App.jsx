@@ -110,32 +110,67 @@ function Planner() {
       let targetUrl = inputUrl;
       let extracted = extractFromUrl(targetUrl);
       let pageTitle = null; let bodyCoords = null;
+
+      // 1. Try to resolve short links (goo.gl, etc.)
       if ((!extracted.coords && !extracted.name) && (inputUrl.includes('goo.gl') || inputUrl.includes('maps.app') || inputUrl.includes('bit.ly'))) {
           setLoadingMsg('Resolving link...');
-          const resolved = await resolveShortUrl(inputUrl);
-          targetUrl = resolved.url; pageTitle = resolved.title; bodyCoords = resolved.coords;
-          const reExtracted = extractFromUrl(targetUrl);
-          extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
+          try {
+            const resolved = await resolveShortUrl(inputUrl);
+            targetUrl = resolved.url; pageTitle = resolved.title; bodyCoords = resolved.coords;
+            const reExtracted = extractFromUrl(targetUrl);
+            extracted = { name: reExtracted.name || extracted.name, coords: reExtracted.coords || extracted.coords };
+          } catch (e) {
+            console.log("Short URL resolution failed, falling back to text search");
+          }
       }
+
       setLoadingMsg('Finding details...');
+      
+      // 2. Setup the Google Places Service
       const service = new google.maps.places.PlacesService(document.createElement('div'));
+      
+      // 3. Wrap the API call in a Promise with a SAFETY TIMEOUT
       return new Promise((resolve, reject) => {
+          // Safety Timer: If Google doesn't answer in 6 seconds, stop loading.
+          const timeoutId = setTimeout(() => {
+              reject("Google Maps API did not respond. Please check your API Key restrictions in Google Cloud Console.");
+          }, 6000);
+
           const handleResults = (results, status) => {
+              clearTimeout(timeoutId); // Stop the safety timer
+              
               if (status === google.maps.places.PlacesServiceStatus.OK && results && results.length > 0) {
+                  // Found a place! Get full details.
                   service.getDetails({ placeId: results[0].place_id, fields: ['name', 'formatted_address', 'geometry', 'opening_hours', 'vicinity'] }, (p, s) => {
-                      if (s === google.maps.places.PlacesServiceStatus.OK) resolve({ place: p, coords: extracted.coords || bodyCoords, url: inputUrl });
-                      else resolve({ place: results[0], coords: extracted.coords || bodyCoords, url: inputUrl });
+                      if (s === google.maps.places.PlacesServiceStatus.OK) {
+                          resolve({ place: p, coords: extracted.coords || bodyCoords, url: inputUrl });
+                      } else {
+                          resolve({ place: results[0], coords: extracted.coords || bodyCoords, url: inputUrl });
+                      }
                   });
               } else {
+                  // No text results found. Did we have coordinates from the URL?
                   const finalCoords = extracted.coords || bodyCoords;
-                  if (finalCoords) resolve({ place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true });
-                  else reject("Could not find location.");
+                  if (finalCoords) {
+                      resolve({ place: { name: pageTitle || "Pinned Location", geometry: { location: finalCoords } }, coords: finalCoords, url: inputUrl, isFallback: true });
+                  } else {
+                      reject("Could not find location. Try a specific name like 'Eiffel Tower'.");
+                  }
               }
           };
-          if (extracted.name) service.textSearch({ query: extracted.name }, handleResults);
-          else if (pageTitle) service.textSearch({ query: pageTitle }, handleResults);
-          else if (extracted.coords || bodyCoords) service.nearbySearch({ location: extracted.coords || bodyCoords, radius: 50 }, handleResults);
-          else service.textSearch({ query: inputUrl }, handleResults);
+
+          // 4. Decide which search method to use
+          if (extracted.name) {
+              service.textSearch({ query: extracted.name }, handleResults);
+          } else if (pageTitle) {
+              service.textSearch({ query: pageTitle }, handleResults);
+          } else if (extracted.coords || bodyCoords) {
+              // If we have coords but no name, search nearby
+              service.nearbySearch({ location: extracted.coords || bodyCoords, radius: 50 }, handleResults);
+          } else {
+              // Fallback: Just search the raw text the user typed
+              service.textSearch({ query: inputUrl }, handleResults);
+          }
       });
   };
 
